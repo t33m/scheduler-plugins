@@ -41,6 +41,105 @@ const highestNUMAID = 8
 
 type PolicyHandler func(pod *v1.Pod, zoneMap topologyv1alpha2.ZoneList) *framework.Status
 
+func restrictedNUMAPodLevelHandler(pod *v1.Pod, zones topologyv1alpha2.ZoneList, nodeInfo *framework.NodeInfo) *framework.Status {
+	klog.V(5).InfoS("Restricted NUMA node handler")
+
+	for _, container := range pod.Spec.InitContainers {
+		klog.V(5).Infof("container.Name: %s", container.Name)
+		klog.V(5).Info("  Requests")
+		for resourceName, quantity := range container.Resources.Requests {
+			klog.V(5).Infof("    resourceName: %s", resourceName)
+			klog.V(5).Infof("    quantity: %s", quantity.String())
+		}
+		klog.V(5).Info("  Limits")
+		for resourceName, quantity := range container.Resources.Limits {
+			klog.V(5).Infof("    resourceName: %s", resourceName)
+			klog.V(5).Infof("    quantity: %s", quantity.String())
+		}
+	}
+
+	var maxRequiredCPU int64
+	for _, container := range pod.Spec.Containers {
+		klog.V(5).Infof("container.Name: %s", container.Name)
+		for resourceName, quantity := range container.Resources.Requests {
+			if resourceName == "cpu" {
+				if cpu, ok := quantity.AsInt64(); ok {
+					if cpu > maxRequiredCPU {
+						maxRequiredCPU = cpu
+					}
+				}
+			}
+		}
+		klog.V(5).Info("  Requests")
+		for resourceName, quantity := range container.Resources.Requests {
+			klog.V(5).Infof("    resourceName: %s", resourceName)
+			klog.V(5).Infof("    quantity: %s", quantity.String())
+		}
+		klog.V(5).Info("  Limits")
+		for resourceName, quantity := range container.Resources.Limits {
+			klog.V(5).Infof("    resourceName: %s", resourceName)
+			klog.V(5).Infof("    quantity: %s", quantity.String())
+		}
+	}
+	klog.V(6).Infof("maxRequiredCPU: %d", maxRequiredCPU)
+
+	var maxAllocatableCPUPerNUMA int64
+	for _, zone := range zones {
+		for _, resource := range zone.Resources {
+			if resource.Name == "cpu" {
+				if cpu, ok := resource.Allocatable.AsInt64(); ok {
+					if cpu > maxAllocatableCPUPerNUMA {
+						maxAllocatableCPUPerNUMA = cpu
+					}
+				}
+			}
+		}
+	}
+	klog.V(6).Infof("maxAllocatableCPUPerNUMA: %d", maxAllocatableCPUPerNUMA)
+
+	// required cpus from more than one NUMA
+	if maxRequiredCPU > maxAllocatableCPUPerNUMA {
+		if int(maxRequiredCPU)%len(zones) != 0 {
+			return framework.NewStatus(framework.Unschedulable,
+				fmt.Sprintf(
+					"cannot align container: number of required cpus %d must be divided by number of NUMA %d without remainder",
+					maxRequiredCPU, len(zones),
+				),
+			)
+		}
+
+		maxRequiredCPUPerNUMA := int(maxRequiredCPU) / len(zones)
+
+		for _, zone := range zones {
+			for _, resource := range zone.Resources {
+				if resource.Name == "cpu" {
+					cpu, ok := resource.Available.AsInt64()
+					klog.V(6).Infof("cpu: %+v", cpu)
+					klog.V(6).Infof("ok: %s", ok)
+					if ok {
+						if int(cpu) < maxRequiredCPUPerNUMA {
+							return framework.NewStatus(framework.Unschedulable,
+								fmt.Sprintf(
+									"cannot align container: number of avialable cpus per NUMA %d less than required %d",
+									cpu, maxRequiredCPUPerNUMA),
+							)
+						}
+					} else {
+						return framework.NewStatus(framework.Unschedulable, "cannot align container: can't get number of available cpus")
+					}
+				}
+			}
+		}
+		return nil
+	}
+
+	status := singleNUMAPodLevelHandler(pod, zones, nodeInfo)
+
+	klog.V(6).Infof("*framework.Status: %+v", status)
+
+	return status
+}
+
 func singleNUMAContainerLevelHandler(pod *v1.Pod, zones topologyv1alpha2.ZoneList, nodeInfo *framework.NodeInfo) *framework.Status {
 	klog.V(5).InfoS("Single NUMA node handler")
 
@@ -98,6 +197,12 @@ func resourcesAvailableInAnyNUMANodes(logID string, numaNodes NUMANodeList, reso
 	nodeResources := util.ResourceList(nodeInfo.Allocatable)
 
 	for resource, quantity := range resources {
+
+		// NOTE(nautim): ignored due to Topology Manager is disabled
+		if resource == "memory" || resource == "hugepages-2Mi" || resource == "hugepages-1Gi" {
+			continue
+		}
+
 		if quantity.IsZero() {
 			// why bother? everything's fine from the perspective of this resource
 			klog.V(4).InfoS("ignoring zero-qty resource request", "logID", logID, "node", nodeName, "resource", resource)
@@ -216,6 +321,9 @@ func (tm *TopologyMatch) Filter(ctx context.Context, cycleState *framework.Cycle
 	klog.V(5).InfoS("Found NodeResourceTopology", "nodeTopology", klog.KObj(nodeTopology))
 
 	handler := filterHandlerFromTopologyManagerConfig(topologyManagerConfigFromNodeResourceTopology(nodeTopology))
+
+	klog.V(5).Infof("Filter handler is %+v", handler)
+
 	if handler == nil {
 		return nil
 	}
@@ -249,6 +357,9 @@ func subtractFromNUMA(nodes NUMANodeList, numaID int, container v1.Container) {
 }
 
 func filterHandlerFromTopologyManagerConfig(conf TopologyManagerConfig) filterFn {
+	if conf.Policy == kubeletconfig.RestrictedTopologyManagerPolicy && conf.Scope == kubeletconfig.PodTopologyManagerScope {
+		return restrictedNUMAPodLevelHandler
+	}
 	if conf.Policy != kubeletconfig.SingleNumaNodeTopologyManagerPolicy {
 		return nil
 	}
